@@ -9,7 +9,6 @@ import (
 	"net"
 	"os/exec"
 	"strings"
-	"testing"
 )
 
 // Container tracks information about the docker container started for tests.
@@ -19,10 +18,11 @@ type Container struct {
 }
 
 // StartContainer starts the specified container for running tests.
-func StartContainer(image string, port string, args ...string) (*Container, error) {
+func StartContainer(image string, port string, dockerArgs []string, appArgs []string) (*Container, error) {
 	arg := []string{"run", "-P", "-d"}
-	arg = append(arg, args...)
+	arg = append(arg, dockerArgs...)
 	arg = append(arg, image)
+	arg = append(arg, appArgs...)
 
 	cmd := exec.Command("docker", arg...)
 	var out bytes.Buffer
@@ -34,6 +34,7 @@ func StartContainer(image string, port string, args ...string) (*Container, erro
 	id := out.String()[:12]
 	hostIP, hostPort, err := extractIPPort(id, port)
 	if err != nil {
+		StopContainer(id)
 		return nil, fmt.Errorf("could not extract ip/port: %w", err)
 	}
 
@@ -41,10 +42,6 @@ func StartContainer(image string, port string, args ...string) (*Container, erro
 		ID:   id,
 		Host: net.JoinHostPort(hostIP, hostPort),
 	}
-
-	fmt.Printf("Image:       %s\n", image)
-	fmt.Printf("ContainerID: %s\n", c.ID)
-	fmt.Printf("Host:        %s\n", c.Host)
 
 	return &c, nil
 }
@@ -54,23 +51,21 @@ func StopContainer(id string) error {
 	if err := exec.Command("docker", "stop", id).Run(); err != nil {
 		return fmt.Errorf("could not stop container: %w", err)
 	}
-	fmt.Println("Stopped:", id)
 
 	if err := exec.Command("docker", "rm", id, "-v").Run(); err != nil {
 		return fmt.Errorf("could not remove container: %w", err)
 	}
-	fmt.Println("Removed:", id)
 
 	return nil
 }
 
 // DumpContainerLogs outputs logs from the running docker container.
-func DumpContainerLogs(t *testing.T, id string) {
+func DumpContainerLogs(id string) []byte {
 	out, err := exec.Command("docker", "logs", id).CombinedOutput()
 	if err != nil {
-		t.Fatalf("could not log container: %v", err)
+		return nil
 	}
-	t.Logf("Logs for %s\n%s:", id, out)
+	return out
 }
 
 func extractIPPort(id string, port string) (hostIP string, hostPort string, err error) {

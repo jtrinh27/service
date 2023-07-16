@@ -1,7 +1,9 @@
 // Package v1 represents types used by the web application for v1.
 package v1
 
-import "errors"
+import (
+	"errors"
+)
 
 // ErrorResponse is the form used for API responses from failures in the API.
 type ErrorResponse struct {

@@ -4,12 +4,16 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/ardanlabs/service)](https://goreportcard.com/report/github.com/ardanlabs/service)
 [![go.mod Go version](https://img.shields.io/github/go-mod/go-version/ardanlabs/service)](https://github.com/ardanlabs/service)
 
-Copyright 2018, 2019, 2020, 2021, 2022, Ardan Labs  
+[![InsightsSnapshot](https://dl.circleci.com/insights-snapshot/gh/ardanlabs/service/master/workflow/badge.svg)](https://app.circleci.com/insights/github/ardanlabs/service/workflows/workflow/overview?branch=master)
+
+Copyright 2018, 2019, 2020, 2021, 2022, 2023, Ardan Labs  
 hello@ardanlabs.com
 
 ## Description
 
 This class teaches how to build production-level services in Go leveraging the power of Kubernetes. From the beginning, you will pair program with the instructor walking through the design philosophies and guidelines for building services in Go. With each new feature that is added to the service, you will learn how to deploy to and manage the Kubernetes environment used to run the service.
+
+This project leverages ideas around clean architecture and domain driven design. This code base, the architecture, and ideas are being used in production Go services running all over the world.
 
 Learn more about the project:
 
@@ -80,6 +84,7 @@ _**Articles**_
 [IT World Canada](http://www.itworldcanada.com/article/nascent-google-development-language-shows-promise-for-more-productive-coding/387449)
 
 _**Video**_  
+[P99 Talk (2022) - Evaluating Performance In Go](https://www.youtube.com/watch?v=PYMs-urosXs)  
 [GopherCon Europe (2022) - Practical Memory Profiling](https://www.youtube.com/watch?v=6qAfkJGWsns)  
 [GDN Event #1 (2021) - GoBridge Needs Your Help](https://www.youtube.com/watch?v=Tst0oI97cvQ&t=2s)  
 [Training Within The Go Community (2019)](https://www.youtube.com/watch?v=PSR1twjzzAM&feature=youtu.be)  
@@ -88,7 +93,6 @@ _**Video**_
 [GopherCon Singapore (2019) - Garbage Collection Semantics](https://www.youtube.com/watch?v=q4HoWwdZUHs)  
 [GopherCon India (2019) - Channel Semantics](https://www.youtube.com/watch?v=AHAf1Xfr_HE)  
 [GoWayFest Minsk (2018) - Profiling Web Apps](https://www.youtube.com/watch?v=-GBMFPegqgw)  
-[GopherChina (2018) - Composition In Go William](https://www.youtube.com/watch?v=pvLUO9ZManM&feature=youtu.be)  
 [GopherCon Singapore (2018) - Optimizing For Correctness](https://engineers.sg/video/optimize-for-correctness-gopherconsg-2018--2610)  
 [GopherCon India (2018) - What is the Legacy You Are Leaving Behind](https://www.youtube.com/watch?v=j3zCUc06OXo&t=0s&index=11&list=PLhJxE57Cki63cElK2kmt3_vi8j2eIHTqZ)  
 [Code::Dive (2017) - Optimizing For Correctness](https://www.youtube.com/watch?v=OTLjN8NQDyo)  
@@ -177,7 +181,7 @@ https://bitfieldconsulting.com/books/fundamentals
 
 We use a Slack channel to share links, code, and examples during the training.  This is free.  This is also the same Slack community you will use after training to ask for help and interact with may Go experts around the world in the community.
 
-1. Using the following link, fill out your name and email address: https://gophersinvite.herokuapp.com/
+1. Using the following link, fill out your name and email address: https://invite.slack.gobridge.org
 1. Check your email, and follow the link to the slack application.
 1. Join the training channel by clicking on this link: https://gophers.slack.com/messages/training/
 1. Click the “Join Channel” button at the bottom of the screen.

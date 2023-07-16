@@ -3,16 +3,18 @@ package commands
 import (
 	"context"
 	"fmt"
+	"net/mail"
 	"time"
 
+	"github.com/ardanlabs/service/business/core/event"
 	"github.com/ardanlabs/service/business/core/user"
-	"github.com/ardanlabs/service/business/sys/database"
-	"github.com/ardanlabs/service/business/web/auth"
-	"go.uber.org/zap"
+	"github.com/ardanlabs/service/business/core/user/stores/userdb"
+	database "github.com/ardanlabs/service/business/sys/database/pgx"
+	"github.com/ardanlabs/service/business/sys/logger"
 )
 
 // UserAdd adds new users into the database.
-func UserAdd(log *zap.SugaredLogger, cfg database.Config, name, email, password string) error {
+func UserAdd(log *logger.Logger, cfg database.Config, name, email, password string) error {
 	if name == "" || email == "" || password == "" {
 		fmt.Println("help: useradd <name> <email> <password>")
 		return ErrHelp
@@ -27,17 +29,23 @@ func UserAdd(log *zap.SugaredLogger, cfg database.Config, name, email, password 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	core := user.NewCore(log, db)
+	evnCore := event.NewCore(log)
+	core := user.NewCore(log, evnCore, userdb.NewStore(log, db))
+
+	addr, err := mail.ParseAddress(email)
+	if err != nil {
+		return fmt.Errorf("parsing email: %w", err)
+	}
 
 	nu := user.NewUser{
 		Name:            name,
-		Email:           email,
+		Email:           *addr,
 		Password:        password,
 		PasswordConfirm: password,
-		Roles:           []string{auth.RoleAdmin, auth.RoleUser},
+		Roles:           []user.Role{user.RoleAdmin, user.RoleUser},
 	}
 
-	usr, err := core.Create(ctx, nu, time.Now())
+	usr, err := core.Create(ctx, nu)
 	if err != nil {
 		return fmt.Errorf("create user: %w", err)
 	}

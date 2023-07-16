@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"expvar"
 	"fmt"
@@ -16,48 +17,39 @@ import (
 	"github.com/ardanlabs/service/app/services/metrics/collector"
 	"github.com/ardanlabs/service/app/services/metrics/publisher"
 	expvarsrv "github.com/ardanlabs/service/app/services/metrics/publisher/expvar"
-	"github.com/ardanlabs/service/foundation/logger"
-	"go.uber.org/automaxprocs/maxprocs"
-	"go.uber.org/zap"
+	prometheussrv "github.com/ardanlabs/service/app/services/metrics/publisher/prometheus"
+	"github.com/ardanlabs/service/business/sys/logger"
 )
 
-// build is the git version of this program. It is set using build flags in the makefile.
 var build = "develop"
 
 func main() {
+	var log *logger.Logger
 
-	// Construct the application logger.
-	log, err := logger.New("METRICS")
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+	events := logger.Events{
+		Error: func(ctx context.Context, r logger.Record) { log.Info(ctx, "******* SEND ALERT ******") },
 	}
-	defer log.Sync()
 
-	// Perform the startup and shutdown sequence.
-	if err := run(log); err != nil {
-		log.Errorw("startup", "ERROR", err)
-		log.Sync()
+	log = logger.NewWithEvents(os.Stdout, logger.LevelInfo, "METRICS", events)
+
+	// -------------------------------------------------------------------------
+
+	ctx := context.Background()
+
+	if err := run(ctx, log); err != nil {
+		log.Error(ctx, "startup", "msg", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *zap.SugaredLogger) error {
+func run(ctx context.Context, log *logger.Logger) error {
 
-	// =========================================================================
+	// -------------------------------------------------------------------------
 	// GOMAXPROCS
 
-	// Want to see what maxprocs reports.
-	opt := maxprocs.Logger(log.Infof)
+	log.Info(ctx, "startup", "GOMAXPROCS", runtime.GOMAXPROCS(0))
 
-	// Set the correct number of threads for the service
-	// based on what is available either by the machine or quotas.
-	if _, err := maxprocs.Set(opt); err != nil {
-		return fmt.Errorf("maxprocs: %w", err)
-	}
-	log.Infow("startup", "GOMAXPROCS", runtime.GOMAXPROCS(0))
-
-	// =========================================================================
+	// -------------------------------------------------------------------------
 	// Configuration
 
 	cfg := struct {
@@ -67,6 +59,14 @@ func run(log *zap.SugaredLogger) error {
 		}
 		Expvar struct {
 			Host            string        `conf:"default:0.0.0.0:3001"`
+			Route           string        `conf:"default:/metrics"`
+			ReadTimeout     time.Duration `conf:"default:5s"`
+			WriteTimeout    time.Duration `conf:"default:10s"`
+			IdleTimeout     time.Duration `conf:"default:120s"`
+			ShutdownTimeout time.Duration `conf:"default:5s"`
+		}
+		Prometheus struct {
+			Host            string        `conf:"default:0.0.0.0:3002"`
 			Route           string        `conf:"default:/metrics"`
 			ReadTimeout     time.Duration `conf:"default:5s"`
 			WriteTimeout    time.Duration `conf:"default:10s"`
@@ -97,25 +97,22 @@ func run(log *zap.SugaredLogger) error {
 		return fmt.Errorf("parsing config: %w", err)
 	}
 
-	// =========================================================================
+	// -------------------------------------------------------------------------
 	// App Starting
 
-	log.Infow("starting service", "version", build)
-	defer log.Infow("shutdown complete")
+	log.Info(ctx, "starting service", "version", build)
+	defer log.Info(ctx, "shutdown complete")
 
 	out, err := conf.String(&cfg)
 	if err != nil {
 		return fmt.Errorf("generating config for output: %w", err)
 	}
-	log.Infow("startup", "config", out)
+	log.Info(ctx, "startup", "config", out)
 
-	// =========================================================================
+	// -------------------------------------------------------------------------
 	// Start Debug Service
 
-	log.Infow("startup", "status", "debug router started", "host", cfg.Web.DebugHost)
-
-	// The Debug function returns a mux to listen and serve on for all the debug
-	// related endpoints. This includes the standard library endpoints.
+	log.Info(ctx, "startup", "status", "debug router started", "host", cfg.Web.DebugHost)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -125,51 +122,49 @@ func run(log *zap.SugaredLogger) error {
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	mux.Handle("/debug/vars", expvar.Handler())
 
-	// Start the service listening for debug requests.
-	// Not concerned with shutting this down with load shedding.
 	go func() {
 		if err := http.ListenAndServe(cfg.Web.DebugHost, mux); err != nil {
-			log.Errorw("shutdown", "status", "debug router closed", "host", cfg.Web.DebugHost, "ERROR", err)
+			log.Error(ctx, "shutdown", "status", "debug router closed", "host", cfg.Web.DebugHost, "msg", err)
 		}
 	}()
 
-	// =========================================================================
+	// -------------------------------------------------------------------------
+	// Start Prometheus Service
+
+	prom := prometheussrv.New(log, cfg.Prometheus.Host, cfg.Prometheus.Route, cfg.Prometheus.ReadTimeout, cfg.Prometheus.WriteTimeout, cfg.Prometheus.IdleTimeout)
+	defer prom.Stop(cfg.Prometheus.ShutdownTimeout)
+
+	// -------------------------------------------------------------------------
 	// Start expvar Service
 
 	exp := expvarsrv.New(log, cfg.Expvar.Host, cfg.Expvar.Route, cfg.Expvar.ReadTimeout, cfg.Expvar.WriteTimeout, cfg.Expvar.IdleTimeout)
 	defer exp.Stop(cfg.Expvar.ShutdownTimeout)
 
-	// =========================================================================
+	// -------------------------------------------------------------------------
 	// Start collectors and publishers
 
-	// Initialize to allow for the collection of metrics.
 	collector, err := collector.New(cfg.Collect.From)
 	if err != nil {
 		return fmt.Errorf("starting collector: %w", err)
 	}
 
-	// Create a stdout publisher.
-	// TODO: Respect the cfg.publish.to config option.
 	stdout := publisher.NewStdout(log)
 
-	// Start the publisher to collect/publish metrics.
-	publish, err := publisher.New(log, collector, cfg.Publish.Interval, exp.Publish, stdout.Publish)
+	publish, err := publisher.New(log, collector, cfg.Publish.Interval, prom.Publish, exp.Publish, stdout.Publish)
 	if err != nil {
 		return fmt.Errorf("starting publisher: %w", err)
 	}
 	defer publish.Stop()
 
-	// =========================================================================
+	// -------------------------------------------------------------------------
 	// Shutdown
 
-	// Make a channel to listen for an interrupt or terminate signal from the OS.
-	// Use a buffered channel because the signal package requires it.
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 	<-shutdown
 
-	log.Infow("shutdown", "status", "shutdown started")
-	defer log.Infow("shutdown", "status", "shutdown complete")
+	log.Info(ctx, "shutdown", "status", "shutdown started")
+	defer log.Info(ctx, "shutdown", "status", "shutdown complete")
 
 	return nil
 }

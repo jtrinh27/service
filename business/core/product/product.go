@@ -9,40 +9,110 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ardanlabs/service/business/core/product/db"
+	"github.com/ardanlabs/service/business/core/event"
+	"github.com/ardanlabs/service/business/core/user"
+	"github.com/ardanlabs/service/business/data/order"
 	"github.com/ardanlabs/service/business/sys/database"
-	"github.com/ardanlabs/service/business/sys/validate"
-	"github.com/jmoiron/sqlx"
-	"go.uber.org/zap"
+	"github.com/ardanlabs/service/business/sys/logger"
+	"github.com/google/uuid"
 )
 
 // Set of error variables for CRUD operations.
 var (
-	ErrNotFound  = errors.New("product not found")
-	ErrInvalidID = errors.New("ID is not in its proper form")
+	ErrNotFound    = errors.New("product not found")
+	ErrInvalidUser = errors.New("user not valid")
+	ErrInvalidCost = errors.New("cost not valid")
 )
+
+// =============================================================================
+
+// Storer interface declares the behavior this package needs to perists and
+// retrieve data.
+type Storer interface {
+	ExecuteUnderTransaction(tx database.Transaction) (Storer, error)
+	Create(ctx context.Context, prd Product) error
+	Update(ctx context.Context, prd Product) error
+	Delete(ctx context.Context, prd Product) error
+	Query(ctx context.Context, filter QueryFilter, orderBy order.By, pageNumber int, rowsPerPage int) ([]Product, error)
+	Count(ctx context.Context, filter QueryFilter) (int, error)
+	QueryByID(ctx context.Context, productID uuid.UUID) (Product, error)
+	QueryByUserID(ctx context.Context, userID uuid.UUID) ([]Product, error)
+}
+
+// UserCore interface declares the behavior this package needs from the user
+// core domain.
+type UserCore interface {
+	ExecuteUnderTransaction(tx database.Transaction) (*user.Core, error)
+	QueryByID(ctx context.Context, userID uuid.UUID) (user.User, error)
+}
+
+// =============================================================================
 
 // Core manages the set of APIs for product access.
 type Core struct {
-	store db.Store
+	log     *logger.Logger
+	evnCore *event.Core
+	usrCore UserCore
+	storer  Storer
 }
 
 // NewCore constructs a core for product api access.
-func NewCore(log *zap.SugaredLogger, sqlxDB *sqlx.DB) Core {
-	return Core{
-		store: db.NewStore(log, sqlxDB),
+func NewCore(log *logger.Logger, evnCore *event.Core, usrCore UserCore, storer Storer) *Core {
+	core := Core{
+		log:     log,
+		evnCore: evnCore,
+		usrCore: usrCore,
+		storer:  storer,
 	}
+
+	core.registerEventHandlers(evnCore)
+
+	return &core
+}
+
+// ExecuteUnderTransaction constructs a new Core value that will use the
+// specified transaction in any store related calls.
+func (c *Core) ExecuteUnderTransaction(tx database.Transaction) (*Core, error) {
+	storer, err := c.storer.ExecuteUnderTransaction(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	usrCore, err := c.usrCore.ExecuteUnderTransaction(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	c = &Core{
+		storer:  storer,
+		evnCore: c.evnCore,
+		usrCore: usrCore,
+		log:     c.log,
+	}
+
+	return c, nil
 }
 
 // Create adds a Product to the database. It returns the created Product with
 // fields like ID and DateCreated populated.
-func (c Core) Create(ctx context.Context, np NewProduct, now time.Time) (Product, error) {
-	if err := validate.Check(np); err != nil {
-		return Product{}, fmt.Errorf("validating data: %w", err)
+func (c *Core) Create(ctx context.Context, np NewProduct) (Product, error) {
+	usr, err := c.usrCore.QueryByID(ctx, np.UserID)
+	if err != nil {
+		return Product{}, fmt.Errorf("user.querybyid: %s: %w", np.UserID, err)
 	}
 
-	dbPrd := db.Product{
-		ID:          validate.GenerateID(),
+	if np.Cost < 0 {
+		return Product{}, ErrInvalidCost
+	}
+
+	if !usr.Enabled {
+		return Product{}, ErrInvalidUser
+	}
+
+	now := time.Now()
+
+	prd := Product{
+		ID:          uuid.New(),
 		Name:        np.Name,
 		Cost:        np.Cost,
 		Quantity:    np.Quantity,
@@ -51,57 +121,37 @@ func (c Core) Create(ctx context.Context, np NewProduct, now time.Time) (Product
 		DateUpdated: now,
 	}
 
-	if err := c.store.Create(ctx, dbPrd); err != nil {
+	if err := c.storer.Create(ctx, prd); err != nil {
 		return Product{}, fmt.Errorf("create: %w", err)
 	}
 
-	return toProduct(dbPrd), nil
+	return prd, nil
 }
 
 // Update modifies data about a Product. It will error if the specified ID is
 // invalid or does not reference an existing Product.
-func (c Core) Update(ctx context.Context, productID string, up UpdateProduct, now time.Time) error {
-	if err := validate.CheckID(productID); err != nil {
-		return ErrInvalidID
-	}
-
-	if err := validate.Check(up); err != nil {
-		return fmt.Errorf("validating data: %w", err)
-	}
-
-	dbPrd, err := c.store.QueryByID(ctx, productID)
-	if err != nil {
-		if errors.Is(err, database.ErrDBNotFound) {
-			return ErrNotFound
-		}
-		return fmt.Errorf("updating product productID[%s]: %w", productID, err)
-	}
-
+func (c *Core) Update(ctx context.Context, prd Product, up UpdateProduct) (Product, error) {
 	if up.Name != nil {
-		dbPrd.Name = *up.Name
+		prd.Name = *up.Name
 	}
 	if up.Cost != nil {
-		dbPrd.Cost = *up.Cost
+		prd.Cost = *up.Cost
 	}
 	if up.Quantity != nil {
-		dbPrd.Quantity = *up.Quantity
+		prd.Quantity = *up.Quantity
 	}
-	dbPrd.DateUpdated = now
+	prd.DateUpdated = time.Now()
 
-	if err := c.store.Update(ctx, dbPrd); err != nil {
-		return fmt.Errorf("update: %w", err)
+	if err := c.storer.Update(ctx, prd); err != nil {
+		return Product{}, fmt.Errorf("update: %w", err)
 	}
 
-	return nil
+	return prd, nil
 }
 
 // Delete removes the product identified by a given ID.
-func (c Core) Delete(ctx context.Context, productID string) error {
-	if err := validate.CheckID(productID); err != nil {
-		return ErrInvalidID
-	}
-
-	if err := c.store.Delete(ctx, productID); err != nil {
+func (c *Core) Delete(ctx context.Context, prd Product) error {
+	if err := c.storer.Delete(ctx, prd); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
 
@@ -109,42 +159,36 @@ func (c Core) Delete(ctx context.Context, productID string) error {
 }
 
 // Query gets all Products from the database.
-func (c Core) Query(ctx context.Context, pageNumber int, rowsPerPage int) ([]Product, error) {
-	dbPrds, err := c.store.Query(ctx, pageNumber, rowsPerPage)
+func (c *Core) Query(ctx context.Context, filter QueryFilter, orderBy order.By, pageNumber int, rowsPerPage int) ([]Product, error) {
+	prds, err := c.storer.Query(ctx, filter, orderBy, pageNumber, rowsPerPage)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
 
-	return toProductSlice(dbPrds), nil
+	return prds, nil
+}
+
+// Count returns the total number of products in the store.
+func (c *Core) Count(ctx context.Context, filter QueryFilter) (int, error) {
+	return c.storer.Count(ctx, filter)
 }
 
 // QueryByID finds the product identified by a given ID.
-func (c Core) QueryByID(ctx context.Context, productID string) (Product, error) {
-	if err := validate.CheckID(productID); err != nil {
-		return Product{}, ErrInvalidID
-	}
-
-	dbPrd, err := c.store.QueryByID(ctx, productID)
+func (c *Core) QueryByID(ctx context.Context, productID uuid.UUID) (Product, error) {
+	prd, err := c.storer.QueryByID(ctx, productID)
 	if err != nil {
-		if errors.Is(err, database.ErrDBNotFound) {
-			return Product{}, ErrNotFound
-		}
-		return Product{}, fmt.Errorf("query: %w", err)
+		return Product{}, fmt.Errorf("query: productID[%s]: %w", productID, err)
 	}
 
-	return toProduct(dbPrd), nil
+	return prd, nil
 }
 
 // QueryByUserID finds the products identified by a given User ID.
-func (c Core) QueryByUserID(ctx context.Context, userID string) ([]Product, error) {
-	if err := validate.CheckID(userID); err != nil {
-		return nil, ErrInvalidID
-	}
-
-	dbPrds, err := c.store.QueryByUserID(ctx, userID)
+func (c *Core) QueryByUserID(ctx context.Context, userID uuid.UUID) ([]Product, error) {
+	prds, err := c.storer.QueryByUserID(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
 
-	return toProductSlice(dbPrds), nil
+	return prds, nil
 }

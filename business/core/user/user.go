@@ -7,131 +7,143 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/mail"
 	"time"
 
-	"github.com/ardanlabs/service/business/core/user/db"
+	"github.com/ardanlabs/service/business/core/event"
+	"github.com/ardanlabs/service/business/data/order"
 	"github.com/ardanlabs/service/business/sys/database"
-	"github.com/ardanlabs/service/business/sys/validate"
-	"github.com/ardanlabs/service/business/web/auth"
-	"github.com/golang-jwt/jwt/v4"
-	"github.com/jmoiron/sqlx"
-	"go.uber.org/zap"
+	"github.com/ardanlabs/service/business/sys/logger"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
 // Set of error variables for CRUD operations.
 var (
 	ErrNotFound              = errors.New("user not found")
-	ErrInvalidID             = errors.New("ID is not in its proper form")
-	ErrInvalidEmail          = errors.New("email is not valid")
 	ErrUniqueEmail           = errors.New("email is not unique")
 	ErrAuthenticationFailure = errors.New("authentication failed")
 )
 
+// =============================================================================
+
+// Storer interface declares the behavior this package needs to perists and
+// retrieve data.
+type Storer interface {
+	ExecuteUnderTransaction(tx database.Transaction) (Storer, error)
+	Create(ctx context.Context, usr User) error
+	Update(ctx context.Context, usr User) error
+	Delete(ctx context.Context, usr User) error
+	Query(ctx context.Context, filter QueryFilter, orderBy order.By, pageNumber int, rowsPerPage int) ([]User, error)
+	Count(ctx context.Context, filter QueryFilter) (int, error)
+	QueryByID(ctx context.Context, userID uuid.UUID) (User, error)
+	QueryByIDs(ctx context.Context, userID []uuid.UUID) ([]User, error)
+	QueryByEmail(ctx context.Context, email mail.Address) (User, error)
+}
+
+// =============================================================================
+
 // Core manages the set of APIs for user access.
 type Core struct {
-	store db.Store
+	storer  Storer
+	evnCore *event.Core
+	log     *logger.Logger
 }
 
 // NewCore constructs a core for user api access.
-func NewCore(log *zap.SugaredLogger, sqlxDB *sqlx.DB) Core {
-	return Core{
-		store: db.NewStore(log, sqlxDB),
+func NewCore(log *logger.Logger, evnCore *event.Core, storer Storer) *Core {
+	return &Core{
+		storer:  storer,
+		evnCore: evnCore,
+		log:     log,
 	}
 }
 
-// Create inserts a new user into the database.
-func (c Core) Create(ctx context.Context, nu NewUser, now time.Time) (User, error) {
-	if err := validate.Check(nu); err != nil {
-		return User{}, fmt.Errorf("validating data: %w", err)
+// ExecuteUnderTransaction constructs a new Core value that will use the
+// specified transaction in any store related calls.
+func (c *Core) ExecuteUnderTransaction(tx database.Transaction) (*Core, error) {
+	trS, err := c.storer.ExecuteUnderTransaction(tx)
+	if err != nil {
+		return nil, err
 	}
 
+	c = &Core{
+		log:     c.log,
+		storer:  trS,
+		evnCore: c.evnCore,
+	}
+
+	return c, nil
+}
+
+// Create inserts a new user into the database.
+func (c *Core) Create(ctx context.Context, nu NewUser) (User, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(nu.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return User{}, fmt.Errorf("generating password hash: %w", err)
+		return User{}, fmt.Errorf("generatefrompassword: %w", err)
 	}
 
-	dbUsr := db.User{
-		ID:           validate.GenerateID(),
+	now := time.Now()
+
+	usr := User{
+		ID:           uuid.New(),
 		Name:         nu.Name,
 		Email:        nu.Email,
 		PasswordHash: hash,
 		Roles:        nu.Roles,
+		Department:   nu.Department,
+		Enabled:      true,
 		DateCreated:  now,
 		DateUpdated:  now,
 	}
 
-	// This provides an example of how to execute a transaction if required.
-	tran := func(tx sqlx.ExtContext) error {
-		if err := c.store.Tran(tx).Create(ctx, dbUsr); err != nil {
-			if errors.Is(err, database.ErrDBDuplicatedEntry) {
-				return fmt.Errorf("create: %w", ErrUniqueEmail)
-			}
-			return fmt.Errorf("create: %w", err)
-		}
-		return nil
+	if err := c.storer.Create(ctx, usr); err != nil {
+		return User{}, fmt.Errorf("create: %w", err)
 	}
 
-	if err := c.store.WithinTran(ctx, tran); err != nil {
-		return User{}, fmt.Errorf("tran: %w", err)
-	}
-
-	return toUser(dbUsr), nil
+	return usr, nil
 }
 
 // Update replaces a user document in the database.
-func (c Core) Update(ctx context.Context, userID string, uu UpdateUser, now time.Time) error {
-	if err := validate.CheckID(userID); err != nil {
-		return ErrInvalidID
-	}
-
-	if err := validate.Check(uu); err != nil {
-		return fmt.Errorf("validating data: %w", err)
-	}
-
-	dbUsr, err := c.store.QueryByID(ctx, userID)
-	if err != nil {
-		if errors.Is(err, database.ErrDBNotFound) {
-			return ErrNotFound
-		}
-		return fmt.Errorf("updating user userID[%s]: %w", userID, err)
-	}
-
+func (c *Core) Update(ctx context.Context, usr User, uu UpdateUser) (User, error) {
 	if uu.Name != nil {
-		dbUsr.Name = *uu.Name
+		usr.Name = *uu.Name
 	}
 	if uu.Email != nil {
-		dbUsr.Email = *uu.Email
+		usr.Email = *uu.Email
 	}
 	if uu.Roles != nil {
-		dbUsr.Roles = uu.Roles
+		usr.Roles = uu.Roles
 	}
 	if uu.Password != nil {
 		pw, err := bcrypt.GenerateFromPassword([]byte(*uu.Password), bcrypt.DefaultCost)
 		if err != nil {
-			return fmt.Errorf("generating password hash: %w", err)
+			return User{}, fmt.Errorf("generatefrompassword: %w", err)
 		}
-		dbUsr.PasswordHash = pw
+		usr.PasswordHash = pw
 	}
-	dbUsr.DateUpdated = now
+	if uu.Department != nil {
+		usr.Department = *uu.Department
+	}
+	if uu.Enabled != nil {
+		usr.Enabled = *uu.Enabled
+	}
+	usr.DateUpdated = time.Now()
 
-	if err := c.store.Update(ctx, dbUsr); err != nil {
-		if errors.Is(err, database.ErrDBDuplicatedEntry) {
-			return fmt.Errorf("updating user userID[%s]: %w", userID, ErrUniqueEmail)
-		}
-		return fmt.Errorf("update: %w", err)
+	if err := c.storer.Update(ctx, usr); err != nil {
+		return User{}, fmt.Errorf("update: %w", err)
 	}
 
-	return nil
+	if err := c.evnCore.SendEvent(ctx, uu.UpdatedEvent(usr.ID)); err != nil {
+		return User{}, fmt.Errorf("failed to send a `%s` event: %w", EventUpdated, err)
+	}
+
+	return usr, nil
 }
 
 // Delete removes a user from the database.
-func (c Core) Delete(ctx context.Context, userID string) error {
-	if err := validate.CheckID(userID); err != nil {
-		return ErrInvalidID
-	}
-
-	if err := c.store.Delete(ctx, userID); err != nil {
+func (c *Core) Delete(ctx context.Context, usr User) error {
+	if err := c.storer.Delete(ctx, usr); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
 
@@ -139,80 +151,64 @@ func (c Core) Delete(ctx context.Context, userID string) error {
 }
 
 // Query retrieves a list of existing users from the database.
-func (c Core) Query(ctx context.Context, pageNumber int, rowsPerPage int) ([]User, error) {
-	dbUsers, err := c.store.Query(ctx, pageNumber, rowsPerPage)
+func (c *Core) Query(ctx context.Context, filter QueryFilter, orderBy order.By, pageNumber int, rowsPerPage int) ([]User, error) {
+	users, err := c.storer.Query(ctx, filter, orderBy, pageNumber, rowsPerPage)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
 
-	return toUserSlice(dbUsers), nil
+	return users, nil
+}
+
+// Count returns the total number of users in the store.
+func (c *Core) Count(ctx context.Context, filter QueryFilter) (int, error) {
+	return c.storer.Count(ctx, filter)
 }
 
 // QueryByID gets the specified user from the database.
-func (c Core) QueryByID(ctx context.Context, userID string) (User, error) {
-	if err := validate.CheckID(userID); err != nil {
-		return User{}, ErrInvalidID
-	}
-
-	dbUsr, err := c.store.QueryByID(ctx, userID)
+func (c *Core) QueryByID(ctx context.Context, userID uuid.UUID) (User, error) {
+	user, err := c.storer.QueryByID(ctx, userID)
 	if err != nil {
-		if errors.Is(err, database.ErrDBNotFound) {
-			return User{}, ErrNotFound
-		}
-		return User{}, fmt.Errorf("query: %w", err)
+		return User{}, fmt.Errorf("query: userID[%s]: %w", userID, err)
 	}
 
-	return toUser(dbUsr), nil
+	return user, nil
+}
+
+// QueryByIDs gets the specified user from the database.
+func (c *Core) QueryByIDs(ctx context.Context, userIDs []uuid.UUID) ([]User, error) {
+	user, err := c.storer.QueryByIDs(ctx, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query: userIDs[%s]: %w", userIDs, err)
+	}
+
+	return user, nil
 }
 
 // QueryByEmail gets the specified user from the database by email.
-func (c Core) QueryByEmail(ctx context.Context, email string) (User, error) {
-
-	// Email Validate function in validate.
-	if !validate.CheckEmail(email) {
-		return User{}, ErrInvalidEmail
-	}
-
-	dbUsr, err := c.store.QueryByEmail(ctx, email)
+func (c *Core) QueryByEmail(ctx context.Context, email mail.Address) (User, error) {
+	user, err := c.storer.QueryByEmail(ctx, email)
 	if err != nil {
-		if errors.Is(err, database.ErrDBNotFound) {
-			return User{}, ErrNotFound
-		}
-		return User{}, fmt.Errorf("query: %w", err)
+		return User{}, fmt.Errorf("query: email[%s]: %w", email, err)
 	}
 
-	return toUser(dbUsr), nil
+	return user, nil
 }
+
+// =============================================================================
 
 // Authenticate finds a user by their email and verifies their password. On
 // success it returns a Claims User representing this user. The claims can be
 // used to generate a token for future authentication.
-func (c Core) Authenticate(ctx context.Context, now time.Time, email, password string) (auth.Claims, error) {
-	dbUsr, err := c.store.QueryByEmail(ctx, email)
+func (c *Core) Authenticate(ctx context.Context, email mail.Address, password string) (User, error) {
+	usr, err := c.QueryByEmail(ctx, email)
 	if err != nil {
-		if errors.Is(err, database.ErrDBNotFound) {
-			return auth.Claims{}, ErrNotFound
-		}
-		return auth.Claims{}, fmt.Errorf("query: %w", err)
+		return User{}, fmt.Errorf("query: email[%s]: %w", email, err)
 	}
 
-	// Compare the provided password with the saved hash. Use the bcrypt
-	// comparison function so it is cryptographically secure.
-	if err := bcrypt.CompareHashAndPassword(dbUsr.PasswordHash, []byte(password)); err != nil {
-		return auth.Claims{}, ErrAuthenticationFailure
+	if err := bcrypt.CompareHashAndPassword(usr.PasswordHash, []byte(password)); err != nil {
+		return User{}, fmt.Errorf("comparehashandpassword: %w", ErrAuthenticationFailure)
 	}
 
-	// If we are this far the request is valid. Create some claims for the user
-	// and generate their token.
-	claims := auth.Claims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   dbUsr.ID,
-			Issuer:    "service project",
-			ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
-		},
-		Roles: dbUsr.Roles,
-	}
-
-	return claims, nil
+	return usr, nil
 }
